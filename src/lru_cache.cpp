@@ -1,4 +1,3 @@
-
 #include "../include/lru_cache.h"
 
 #include <iostream>
@@ -6,22 +5,30 @@
 
 using namespace std;
 
+/**
+ * @file lru_cache.cpp
+ * @brief Implements the thread-safe LRU cache using a list and hash map.
+ *
+ * The list maintains MRU -> LRU order, while the hash map provides
+ * O(1) average-time access to cache entries.
+ */
+
+// Creates an LRU cache with the given capacity.
 LRUCache::LRUCache(int _capacity)
 {
     if (_capacity < 0)
     {
         throw invalid_argument(
-            "Cache capacity cannot be negative"
-        );
+            "Cache capacity cannot be negative");
     }
 
     this->capacity = _capacity;
 }
 
 // Inserts a new key-value pair or updates an existing key.
-void LRUCache::put(const string& key, const string& value)
+void LRUCache::put(const string &key, const string &value)
 {
-    // Lock the cache for the duration of this function.
+    // Lock the cache while modifying shared data.
     lock_guard<mutex> lock(cacheMutex);
 
     // Capacity 0 means caching is disabled.
@@ -32,18 +39,18 @@ void LRUCache::put(const string& key, const string& value)
 
     auto it = cacheMap.find(key);
 
-    // If the key already exists, remove its old position.
+    // Remove the old entry if the key already exists.
     if (it != cacheMap.end())
     {
         cacheList.erase(it->second);
         cacheMap.erase(it);
     }
 
-    // Insert the new entry at the front (MRU).
+    // Add the new entry at the front as MRU.
     cacheList.push_front({key, value});
     cacheMap[key] = cacheList.begin();
 
-    // If capacity is exceeded, remove the LRU entry.
+    // Remove the least recently used entry if capacity is exceeded.
     if (cacheMap.size() > capacity)
     {
         auto it = cacheList.rbegin();
@@ -53,36 +60,36 @@ void LRUCache::put(const string& key, const string& value)
     }
 }
 
-// Retrieves a value and moves the key to MRU.
-optional<string> LRUCache::get(const string& key)
+// Retrieves a value and moves the key to the MRU position.
+optional<string> LRUCache::get(const string &key)
 {
-    // Lock the cache for the duration of this function.
+    // Lock the cache while accessing and updating shared data.
     lock_guard<mutex> lock(cacheMutex);
 
     auto it = cacheMap.find(key);
 
+    // Key is not present in the cache.
     if (it == cacheMap.end())
     {
         return nullopt;
     }
 
-    // Save the value before moving the node.
+    // Save the value before moving the entry.
     string value = it->second->second;
 
-    // Move the accessed node to the front (MRU).
+    // Move the accessed entry to the front as MRU.
     cacheList.splice(
-        cacheList.begin(), // which position to add before
-        cacheList, // List name
-        it->second // element
-    );
+        cacheList.begin(),
+        cacheList,
+        it->second);
 
     return value;
 }
 
-// Removes a key from the cache.
-void LRUCache::remove(const string& key)
+// Removes a key from the cache if it exists.
+void LRUCache::remove(const string &key)
 {
-    // Lock the cache for the duration of this function.
+    // Lock the cache while modifying shared data.
     lock_guard<mutex> lock(cacheMutex);
 
     auto it = cacheMap.find(key);
@@ -99,7 +106,7 @@ void LRUCache::remove(const string& key)
 // Prints cache contents from MRU to LRU.
 void LRUCache::print() const
 {
-    // Lock because this function reads shared data.
+    // Lock because this function reads shared cache data.
     lock_guard<mutex> lock(cacheMutex);
 
     if (cacheList.empty())
@@ -110,16 +117,16 @@ void LRUCache::print() const
 
     cout << "MRU → LRU" << endl;
 
-    for (const auto& entry : cacheList)
+    for (const auto &entry : cacheList)
     {
         cout << entry.first << " → " << entry.second << endl;
     }
 }
 
-// Returns the number of entries in the cache.
+// Returns the current number of entries in the cache.
 int LRUCache::size() const
 {
-    // Lock because this function reads shared data.
+    // Lock because this function reads shared cache data.
     lock_guard<mutex> lock(cacheMutex);
 
     return static_cast<int>(cacheMap.size());

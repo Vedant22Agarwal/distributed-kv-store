@@ -10,9 +10,12 @@
 
 using namespace std;
 
-/*
- * Represents one operation stored in the WAL.
+/**
+ * @file wal.h
+ * @brief Provides Write-Ahead Logging for persistence and recovery.
  */
+
+// Represents a single operation stored in the WAL.
 struct WALRecord
 {
     long long sequenceNumber;
@@ -21,11 +24,11 @@ struct WALRecord
     string value;
 };
 
-/*
- * Write-Ahead Log.
+/**
+ * Manages the Write-Ahead Log (WAL).
  *
  * Stores every modification made to the key-value store
- * and provides recovery through WAL replay.
+ * and supports recovery by replaying logged operations.
  */
 class WAL
 {
@@ -55,46 +58,43 @@ public:
     // Closes the WAL file.
     ~WAL();
 
-    // WAL owns a file stream and mutex, so copying is disabled.
+    // Copying is disabled because WAL owns a file stream and mutex.
     WAL(const WAL &) = delete;
     WAL &operator=(const WAL &) = delete;
 
-    // Log a new SET operation.
+    // Logs a new SET operation.
     bool logSet(
         const string &key,
         const string &value);
 
-    // Log a new DELETE operation.
+    // Logs a new DELETE operation.
     bool logDelete(
         const string &key);
 
-    // Flush buffered WAL data to disk.
+    // Flushes buffered WAL data to disk.
     void flush();
 
-    // Replay WAL operations into the key-value store.
+    // Replays WAL operations to restore the key-value store.
     bool replay(
         LRUCache &store);
 
-    /*
-     * Log operations using an explicitly supplied sequence number.
-     *
-     * Used by backup nodes so that they preserve the
-     * primary's sequence numbers during replication.
-     */
-
+    // Logs a SET operation with a specific sequence number.
+    // Used by backup nodes during replication.
     bool logSetWithSequence(
         long long sequenceNumber,
         const string &key,
         const string &value);
 
+    // Logs a DELETE operation with a specific sequence number.
+    // Used by backup nodes during replication.
     bool logDeleteWithSequence(
         long long sequenceNumber,
         const string &key);
 
-    // Return the latest sequence number in the WAL.
+    // Returns the latest sequence number stored in the WAL.
     long long getLastSequenceNumber();
 
-    // Return WAL records starting from the given sequence number.
+    // Returns WAL records starting from the given sequence number.
     vector<WALRecord> getRecordsFromSequence(
         long long startSequence);
 };

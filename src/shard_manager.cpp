@@ -1,7 +1,14 @@
+
+/**
+ * @file shard_manager.cpp
+ * @brief Implements shard configuration and key-to-shard mapping.
+ */
+
 #include "../include/shard_manager.h"
 
 #include <algorithm>
 
+// Creates the requested number of shards.
 ShardManager::ShardManager(int shardCount)
 {
     if (shardCount <= 0)
@@ -11,6 +18,7 @@ ShardManager::ShardManager(int shardCount)
         shards.emplace_back(i);
 }
 
+// Computes the 64-bit FNV-1a hash for a key.
 uint64_t ShardManager::fnv1a(const string& key) const
 {
     const uint64_t FNV_OFFSET_BASIS = 14695981039346656037ULL;
@@ -27,16 +35,19 @@ uint64_t ShardManager::fnv1a(const string& key) const
     return hash;
 }
 
+// Maps a key to its shard using the FNV-1a hash.
 int ShardManager::getShard(const string& key) const
 {
     return fnv1a(key) % shards.size();
 }
 
+// Returns the total number of configured shards.
 int ShardManager::getShardCount() const
 {
     return shards.size();
 }
 
+// Sets the primary node for a shard.
 void ShardManager::setPrimary(
     int shardId,
     const string& host,
@@ -54,6 +65,7 @@ void ShardManager::setPrimary(
     shards[shardId].primaryPort = port;
 }
 
+// Adds a backup node to a shard.
 void ShardManager::addBackup(
     int shardId,
     const string& host,
@@ -70,6 +82,7 @@ void ShardManager::addBackup(
     shards[shardId].backups.emplace_back(host, port);
 }
 
+// Returns a copy of the shard configuration.
 Shard ShardManager::getShardInfo(int shardId) const
 {
     lock_guard<mutex> lock(managerMutex);
@@ -80,6 +93,7 @@ Shard ShardManager::getShardInfo(int shardId) const
     return shards[shardId];
 }
 
+// Promotes a configured backup to become the shard primary.
 bool ShardManager::promoteBackup(
     int shardId,
     const string& host,

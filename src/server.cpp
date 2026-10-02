@@ -1,3 +1,10 @@
+/**
+ * @file server.cpp
+ * @brief Implements the primary shard server for the key-value store.
+ *
+ * Handles client requests, WAL persistence, replication, and recovery.
+ */
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -21,73 +28,53 @@
 
 using namespace std;
 
+// In-memory cache used by the primary node.
 LRUCache store(1000);
 
-WAL wal(
-    getenv("KV_WAL_PATH")
-        ? getenv("KV_WAL_PATH")
-        : "files/server.wal");
+// WAL used to persist primary operations.
+WAL wal(getenv("KV_WAL_PATH") ? getenv("KV_WAL_PATH") : "files/server.wal");
 
+// Protects WAL and cache updates during write operations.
 mutex storageMutex;
 
+// Manages replication to configured backup nodes.
 ReplicationManager replicationManager(&wal);
 
 namespace
 {
-constexpr int CLIENT_TIMEOUT_SECONDS = 10;
-constexpr int MAX_COMMAND_SIZE = 65536;
+    constexpr int CLIENT_TIMEOUT_SECONDS = 10;
+    constexpr int MAX_COMMAND_SIZE = 65536;
 
-bool configureClientSocket(int socket)
-{
-    int noSigPipe = 1;
-
-    if (setsockopt(
-            socket,
-            SOL_SOCKET,
-            SO_NOSIGPIPE,
-            &noSigPipe,
-            sizeof(noSigPipe)) < 0)
+    // Configures socket timeouts and prevents SIGPIPE on macOS.
+    bool configureClientSocket(int socket)
     {
-        return false;
+        int noSigPipe = 1;
+
+        if (setsockopt( socket, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, sizeof(noSigPipe)) < 0)
+        {
+            return false;
+        }
+
+        timeval timeout{};
+        timeout.tv_sec = CLIENT_TIMEOUT_SECONDS;
+        timeout.tv_usec = 0;
+
+        if (setsockopt(socket,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout)) < 0)
+        {
+            return false;
+        }
+
+        if (setsockopt(socket,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof(timeout)) < 0)
+        {
+            return false;
+        }
+
+        return true;
     }
-
-    timeval timeout{};
-    timeout.tv_sec = CLIENT_TIMEOUT_SECONDS;
-    timeout.tv_usec = 0;
-
-    if (setsockopt(
-            socket,
-            SOL_SOCKET,
-            SO_RCVTIMEO,
-            &timeout,
-            sizeof(timeout)) < 0)
-    {
-        return false;
-    }
-
-    if (setsockopt(
-            socket,
-            SOL_SOCKET,
-            SO_SNDTIMEO,
-            &timeout,
-            sizeof(timeout)) < 0)
-    {
-        return false;
-    }
-
-    return true;
-}
 }
 
-/*
- * ============================================================
- * SEND ALL
- * ============================================================
- */
-
-bool sendAll(
-    int socket,
-    const string &message)
+// Sends the complete message even when send() writes only part of it.
+bool sendAll(int socket,const string &message)
 {
     size_t totalSent = 0;
 
@@ -117,19 +104,13 @@ bool sendAll(
     return true;
 }
 
-/*
- * ============================================================
- * PROCESS COMMAND
- * ============================================================
- */
-
+// Parses and executes a single client command.
 string processCommand(const string &command)
 {
     string inputCommand = command;
 
-    while (!inputCommand.empty() &&
-           (inputCommand.back() == '\n' ||
-            inputCommand.back() == '\r'))
+    // Remove trailing newline characters from the received command.
+    while (!inputCommand.empty() && (inputCommand.back() == '\n' || inputCommand.back() == '\r'))
     {
         inputCommand.pop_back();
     }
@@ -141,10 +122,7 @@ string processCommand(const string &command)
 
     if (inputCommand == "STATUS")
     {
-        return "LAST_SEQUENCE " +
-               to_string(
-                   wal.getLastSequenceNumber()) +
-               "\n";
+        return "LAST_SEQUENCE " + to_string( wal.getLastSequenceNumber()) + "\n";
     }
 
     stringstream input(inputCommand);
@@ -160,44 +138,38 @@ string processCommand(const string &command)
         string value;
         getline(input, value);
 
-        if (!value.empty() &&
-            value[0] == ' ')
+        if (!value.empty() && value[0] == ' ')
         {
             value.erase(0, 1);
         }
 
-        if (key.empty() ||
-            value.empty())
+        if (key.empty() || value.empty())
         {
             return "ERROR Invalid SET command\n";
         }
 
+        // Serialize WAL, replication, and cache updates.
         lock_guard<mutex> lock(storageMutex);
 
+        // Persist the operation before updating in-memory state.
         if (!wal.logSet(key, value))
         {
             return "ERROR: WAL write failed\n";
         }
 
-        long long sequenceNumber =
-            wal.getLastSequenceNumber();
+        long long sequenceNumber = wal.getLastSequenceNumber();
 
-        cout << "Primary WAL sequence: "
-             << sequenceNumber
-             << endl;
+        cout << "Primary WAL sequence: " << sequenceNumber << endl;
 
-        bool replicationSuccessful =
-            replicationManager.replicateSet(
-                sequenceNumber,
-                key,
-                value);
+        // Replicate the operation to configured backups.
+        bool replicationSuccessful = replicationManager.replicateSet( sequenceNumber, key, value);
 
         if (!replicationSuccessful)
         {
-            cerr << "WARNING: SET replication incomplete"
-                 << endl;
+            cerr << "WARNING: SET replication incomplete" << endl;
         }
 
+        // Update the primary cache after WAL persistence.
         store.put(key, value);
 
         return "ADDED\n";
@@ -215,6 +187,7 @@ string processCommand(const string &command)
 
         string value;
 
+        // Prefer a healthy, up-to-date replica when available.
         if (replicationManager.getFromHealthyReplica(
                 key,
                 value))
@@ -227,6 +200,7 @@ string processCommand(const string &command)
                    "\n";
         }
 
+        // Fall back to the primary's local cache.
         auto result =
             store.get(key);
 
@@ -250,6 +224,7 @@ string processCommand(const string &command)
             return "ERROR Invalid DEL command\n";
         }
 
+        // Serialize WAL, replication, and cache updates.
         lock_guard<mutex> lock(storageMutex);
 
         if (!wal.logDelete(key))
@@ -264,6 +239,7 @@ string processCommand(const string &command)
              << sequenceNumber
              << endl;
 
+        // Replicate the delete operation to backups.
         bool replicationSuccessful =
             replicationManager.replicateDelete(
                 sequenceNumber,
@@ -283,12 +259,7 @@ string processCommand(const string &command)
     return "ERROR: Unknown command\n";
 }
 
-/*
- * ============================================================
- * HANDLE CLIENT
- * ============================================================
- */
-
+// Handles all requests from one connected client.
 void handleClient(
     int clientSocket,
     sockaddr_in clientAddress)
@@ -322,6 +293,7 @@ void handleClient(
 
     char buffer[1024]{};
 
+    // Keep the connection open for multiple requests.
     while (true)
     {
         ssize_t bytesReceived =
@@ -392,12 +364,6 @@ void handleClient(
          << endl;
 }
 
-/*
- * ============================================================
- * MAIN
- * ============================================================
- */
-
 int main(
     int argc,
     char *argv[])
@@ -439,12 +405,7 @@ int main(
         return 1;
     }
 
-    /*
-     * --------------------------------------------------------
-     * REGISTER BACKUPS
-     * --------------------------------------------------------
-     */
-
+    // Register the backups used for replication.
     replicationManager.addBackup(
         "127.0.0.1",
         backup1Port);
@@ -453,15 +414,10 @@ int main(
         "127.0.0.1",
         backup2Port);
 
-    /*
-     * --------------------------------------------------------
-     * RECOVER PRIMARY STATE
-     * --------------------------------------------------------
-     */
-
     cout << "Starting server..."
          << endl;
 
+    // Recover the primary's in-memory state from the WAL.
     cout << "Replaying WAL..."
          << endl;
 
@@ -477,22 +433,13 @@ int main(
     cout << "WAL replay completed successfully."
          << endl;
 
-    /*
-     * --------------------------------------------------------
-     * CATCH UP BACKUPS
-     * --------------------------------------------------------
-     */
-
+    // Bring lagging backups up to the primary's WAL sequence.
     replicationManager.catchUpAllBackups();
 
+    // Start background backup health monitoring.
     replicationManager.startHealthMonitoring();
 
-    /*
-     * --------------------------------------------------------
-     * CREATE SERVER SOCKET
-     * --------------------------------------------------------
-     */
-
+    // Create the TCP listening socket.
     int serverSocket =
         socket(
             AF_INET,
@@ -507,12 +454,7 @@ int main(
         return 1;
     }
 
-    /*
-     * --------------------------------------------------------
-     * ALLOW PORT REUSE
-     * --------------------------------------------------------
-     */
-
+    // Allow the server to reuse its port after restart.
     int reuse = 1;
 
     if (setsockopt(
@@ -530,12 +472,7 @@ int main(
         return 1;
     }
 
-    /*
-     * --------------------------------------------------------
-     * SERVER ADDRESS
-     * --------------------------------------------------------
-     */
-
+    // Configure the address used by the primary server.
     sockaddr_in serverAddress{};
 
     serverAddress.sin_family =
@@ -547,12 +484,7 @@ int main(
     serverAddress.sin_addr.s_addr =
         INADDR_ANY;
 
-    /*
-     * --------------------------------------------------------
-     * BIND
-     * --------------------------------------------------------
-     */
-
+    // Bind the socket to the selected port.
     if (::bind(
             serverSocket,
             reinterpret_cast<sockaddr *>(
@@ -567,12 +499,7 @@ int main(
         return 1;
     }
 
-    /*
-     * --------------------------------------------------------
-     * LISTEN
-     * --------------------------------------------------------
-     */
-
+    // Start listening for client connections.
     if (listen(
             serverSocket,
             SOMAXCONN) == -1)
@@ -590,12 +517,7 @@ int main(
          << "..."
          << endl;
 
-    /*
-     * --------------------------------------------------------
-     * ACCEPT CLIENTS
-     * --------------------------------------------------------
-     */
-
+    // Accept clients and handle each connection in its own thread.
     while (true)
     {
         sockaddr_in clientAddress{};

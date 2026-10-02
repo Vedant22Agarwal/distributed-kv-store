@@ -16,60 +16,69 @@
 
 using namespace std;
 
+/**
+ * @file backup_server.cpp
+ * @brief Implements a backup KV node that persists replicated operations
+ *        using WAL and serves GET requests over TCP.
+ */
+
 LRUCache store(1000);
-WAL* wal = nullptr;
+WAL *wal = nullptr;
 mutex storageMutex;
 
 namespace
 {
-constexpr int CLIENT_TIMEOUT_SECONDS = 10;
-constexpr size_t MAX_PENDING_SIZE = 65536;
+    constexpr int CLIENT_TIMEOUT_SECONDS = 10;
+    constexpr size_t MAX_PENDING_SIZE = 65536;
 
-bool configureClientSocket(int socket)
-{
-    int noSigPipe = 1;
-
-    if (setsockopt(
-            socket,
-            SOL_SOCKET,
-            SO_NOSIGPIPE,
-            &noSigPipe,
-            sizeof(noSigPipe)) < 0)
+    // Configures socket options for reliable client communication.
+    bool configureClientSocket(int socket)
     {
-        return false;
+        int noSigPipe = 1;
+
+        // Prevents the process from receiving SIGPIPE if the client disconnects.
+        if (setsockopt(
+                socket,
+                SOL_SOCKET,
+                SO_NOSIGPIPE,
+                &noSigPipe,
+                sizeof(noSigPipe)) < 0)
+        {
+            return false;
+        }
+
+        timeval timeout{};
+        timeout.tv_sec = CLIENT_TIMEOUT_SECONDS;
+        timeout.tv_usec = 0;
+
+        // Prevents recv() from blocking forever.
+        if (setsockopt(
+                socket,
+                SOL_SOCKET,
+                SO_RCVTIMEO,
+                &timeout,
+                sizeof(timeout)) < 0)
+        {
+            return false;
+        }
+
+        // Prevents send() from blocking forever.
+        if (setsockopt(
+                socket,
+                SOL_SOCKET,
+                SO_SNDTIMEO,
+                &timeout,
+                sizeof(timeout)) < 0)
+        {
+            return false;
+        }
+
+        return true;
     }
-
-    timeval timeout{};
-    timeout.tv_sec = CLIENT_TIMEOUT_SECONDS;
-    timeout.tv_usec = 0;
-
-    if (setsockopt(
-            socket,
-            SOL_SOCKET,
-            SO_RCVTIMEO,
-            &timeout,
-            sizeof(timeout)) < 0)
-    {
-        return false;
-    }
-
-    if (setsockopt(
-            socket,
-            SOL_SOCKET,
-            SO_SNDTIMEO,
-            &timeout,
-            sizeof(timeout)) < 0)
-    {
-        return false;
-    }
-
-    return true;
 }
-}
 
-bool sendAll(
-    int sock,
-    const string& message)
+// Sends the complete message even if send() writes only part of it.
+bool sendAll(int sock, const string &message)
 {
     size_t sent = 0;
 
@@ -87,8 +96,8 @@ bool sendAll(
             continue;
         }
 
-        if (n < 0 &&
-            errno == EINTR)
+        // Retry if the system call was interrupted.
+        if (n < 0 && errno == EINTR)
         {
             continue;
         }
@@ -99,8 +108,8 @@ bool sendAll(
     return true;
 }
 
-string processReplicationCommand(
-    const string& command)
+// Processes commands received by the backup node.
+string processReplicationCommand(const string &command)
 {
     stringstream input(command);
     string operation;
@@ -108,19 +117,19 @@ string processReplicationCommand(
     if (!(input >> operation))
         return "ERROR: Empty command\n";
 
+    // Health check from the primary.
     if (operation == "PING")
         return "PONG\n";
 
+    // Returns the latest WAL sequence number stored by this backup.
     if (operation == "STATUS")
     {
         lock_guard<mutex> lock(storageMutex);
 
-        return "LAST_SEQUENCE " +
-               to_string(
-                   wal->getLastSequenceNumber()) +
-               "\n";
+        return "LAST_SEQUENCE " + to_string(wal->getLastSequenceNumber()) + "\n";
     }
 
+    // Reads a value directly from the backup cache.
     if (operation == "GET")
     {
         string key;
@@ -134,14 +143,13 @@ string processReplicationCommand(
 
         if (result.has_value())
         {
-            return "VALUE: " +
-                   result.value() +
-                   "\n";
+            return "VALUE: " + result.value() + "\n";
         }
 
         return "NOT_FOUND\n";
     }
 
+    // Handles a direct SET operation on the backup.
     if (operation == "SET")
     {
         string key;
@@ -152,8 +160,7 @@ string processReplicationCommand(
         string value;
         getline(input, value);
 
-        if (!value.empty() &&
-            value[0] == ' ')
+        if (!value.empty() && value[0] == ' ')
         {
             value.erase(0, 1);
         }
@@ -166,14 +173,13 @@ string processReplicationCommand(
         long long sequence =
             wal->getLastSequenceNumber() + 1;
 
+        // Persist the operation before updating the cache.
         if (!wal->logSetWithSequence(
                 sequence,
                 key,
                 value))
         {
-            cerr << "SET WAL write failed at sequence "
-                 << sequence
-                 << endl;
+            cerr << "SET WAL write failed at sequence " << sequence << endl;
 
             return "ERROR: WAL write failed\n";
         }
@@ -183,6 +189,7 @@ string processReplicationCommand(
         return "ADDED\n";
     }
 
+    // Handles a direct DELETE operation on the backup.
     if (operation == "DEL")
     {
         string key;
@@ -200,13 +207,12 @@ string processReplicationCommand(
         long long sequence =
             wal->getLastSequenceNumber() + 1;
 
+        // Persist the delete operation before modifying the cache.
         if (!wal->logDeleteWithSequence(
                 sequence,
                 key))
         {
-            cerr << "DEL WAL write failed at sequence "
-                 << sequence
-                 << endl;
+            cerr << "DEL WAL write failed at sequence " << sequence << endl;
 
             return "ERROR: WAL write failed\n";
         }
@@ -216,8 +222,8 @@ string processReplicationCommand(
         return "DELETED\n";
     }
 
-    if (operation == "REPL_SET" ||
-        operation == "REPL_DEL")
+    // Handles replication commands sent by the primary.
+    if (operation == "REPL_SET" || operation == "REPL_DEL")
     {
         long long sequence;
 
@@ -235,8 +241,7 @@ string processReplicationCommand(
         {
             getline(input, value);
 
-            if (!value.empty() &&
-                value[0] == ' ')
+            if (!value.empty() && value[0] == ' ')
             {
                 value.erase(0, 1);
             }
@@ -247,16 +252,12 @@ string processReplicationCommand(
 
         lock_guard<mutex> lock(storageMutex);
 
-        long long expected =
-            wal->getLastSequenceNumber() + 1;
+        // Backup only accepts the next expected sequence number.
+        long long expected = wal->getLastSequenceNumber() + 1;
 
         if (sequence != expected)
         {
-            cerr << "Replication sequence mismatch. Expected "
-                 << expected
-                 << ", received "
-                 << sequence
-                 << endl;
+            cerr << "Replication sequence mismatch. Expected " << expected << ", received " << sequence << endl;
 
             return "ERROR_SEQUENCE\n";
         }
@@ -265,28 +266,21 @@ string processReplicationCommand(
 
         if (operation == "REPL_SET")
         {
-            success =
-                wal->logSetWithSequence(
-                    sequence,
-                    key,
-                    value);
+            success = wal->logSetWithSequence(sequence, key, value);
         }
         else
         {
-            success =
-                wal->logDeleteWithSequence(
-                    sequence,
-                    key);
+            success = wal->logDeleteWithSequence(sequence, key);
         }
 
         if (!success)
         {
-            cerr << "Replication WAL write failed"
-                 << endl;
+            cerr << "Replication WAL write failed" << endl;
 
             return "ERROR: WAL write failed\n";
         }
 
+        // Update the in-memory cache only after WAL persistence succeeds.
         if (operation == "REPL_SET")
         {
             store.put(key, value);
@@ -302,14 +296,12 @@ string processReplicationCommand(
     return "ERROR: Unknown command\n";
 }
 
-void handleClient(
-    int clientSocket)
+// Handles a TCP connection from a primary or client.
+void handleClient(int clientSocket)
 {
-    if (!configureClientSocket(
-            clientSocket))
+    if (!configureClientSocket(clientSocket))
     {
-        cerr << "Failed to configure backup client socket"
-             << endl;
+        cerr << "Failed to configure backup client socket" << endl;
 
         close(clientSocket);
         return;
@@ -329,48 +321,34 @@ void handleClient(
 
         if (received > 0)
         {
-            pending.append(
-                buffer,
-                static_cast<size_t>(received));
+            // TCP may split or combine messages, so keep
+            // incomplete data until a newline is received.
+            pending.append(buffer, static_cast<size_t>(received));
 
-            if (pending.size() >
-                MAX_PENDING_SIZE)
+            if (pending.size() > MAX_PENDING_SIZE)
             {
-                sendAll(
-                    clientSocket,
-                    "ERROR: Command too large\n");
-
+                sendAll(clientSocket, "ERROR: Command too large\n");
                 break;
             }
 
             size_t pos;
 
-            while ((pos =
-                        pending.find('\n'))
-                   != string::npos)
+            // Process every complete newline-terminated command.
+            while ((pos = pending.find('\n')) != string::npos)
             {
-                string command =
-                    pending.substr(
-                        0,
-                        pos);
+                string command = pending.substr(0, pos);
 
-                pending.erase(
-                    0,
-                    pos + 1);
+                pending.erase(0, pos + 1);
 
-                if (!command.empty() &&
-                    command.back() == '\r')
+                // Support both \n and \r\n line endings.
+                if (!command.empty() && command.back() == '\r')
                 {
                     command.pop_back();
                 }
 
-                string response =
-                    processReplicationCommand(
-                        command);
+                string response = processReplicationCommand(command);
 
-                if (!sendAll(
-                        clientSocket,
-                        response))
+                if (!sendAll(clientSocket, response))
                 {
                     close(clientSocket);
                     return;
@@ -380,11 +358,13 @@ void handleClient(
             continue;
         }
 
+        // Client closed the connection.
         if (received == 0)
         {
             break;
         }
 
+        // Retry when recv() is interrupted.
         if (errno == EINTR)
         {
             continue;
@@ -396,62 +376,50 @@ void handleClient(
     close(clientSocket);
 }
 
-int main(
-    int argc,
-    char* argv[])
+int main(int argc, char *argv[])
 {
+    // Default backup port.
     int port = 9002;
 
     try
     {
+        // Allow the backup port to be provided through the command line.
         if (argc >= 2)
             port = stoi(argv[1]);
     }
-    catch (const exception& e)
+    catch (const exception &e)
     {
-        cerr << "Invalid port: "
-             << e.what()
-             << endl;
+        cerr << "Invalid port: " << e.what() << endl;
 
         return 1;
     }
 
-    if (port < 1 ||
-        port > 65535)
+    if (port < 1 || port > 65535)
     {
-        cerr << "Port must be between 1 and 65535"
-             << endl;
+        cerr << "Port must be between 1 and 65535" << endl;
 
         return 1;
     }
 
-    string walPath =
-        "files/backup-" +
-        to_string(port) +
-        ".wal";
+    // Each backup node uses its own WAL file based on its port.
+    string walPath = "files/backup-" + to_string(port) + ".wal";
 
     WAL backupWal(walPath);
 
     wal = &backupWal;
 
-    cout << "Starting backup on port "
-         << port
-         << endl;
+    cout << "Starting backup on port " << port << endl;
 
+    // Restore the cache from the existing WAL before accepting requests.
     if (!wal->replay(store))
     {
-        cerr << "WAL replay failed for "
-             << walPath
-             << endl;
+        cerr << "WAL replay failed for " << walPath << endl;
 
         return 1;
     }
 
-    int serverSocket =
-        socket(
-            AF_INET,
-            SOCK_STREAM,
-            0);
+    // Create the TCP server socket.
+    int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
 
     if (serverSocket == -1)
     {
@@ -461,6 +429,7 @@ int main(
 
     int reuse = 1;
 
+    // Allows the server to reuse the port after restarting.
     if (setsockopt(
             serverSocket,
             SOL_SOCKET,
@@ -477,6 +446,7 @@ int main(
 
     int noSigPipe = 1;
 
+    // Prevents SIGPIPE when sending to a disconnected client.
     if (setsockopt(
             serverSocket,
             SOL_SOCKET,
@@ -493,30 +463,28 @@ int main(
 
     sockaddr_in address{};
 
-    address.sin_family =
-        AF_INET;
+    address.sin_family = AF_INET;
 
-    address.sin_addr.s_addr =
-        INADDR_ANY;
+    // Accept connections on all available network interfaces.
+    address.sin_addr.s_addr = INADDR_ANY;
 
-    address.sin_port =
-        htons(port);
+    address.sin_port = htons(port);
 
+    // Bind the server socket to the selected port.
     if (::bind(
             serverSocket,
-            reinterpret_cast<sockaddr*>(
+            reinterpret_cast<sockaddr *>(
                 &address),
             sizeof(address)) == -1)
     {
-        cerr << "Bind failed on port "
-             << port
-             << endl;
+        cerr << "Bind failed on port " << port << endl;
 
         close(serverSocket);
 
         return 1;
     }
 
+    // Start listening for incoming TCP connections.
     if (listen(
             serverSocket,
             SOMAXCONN) == -1)
@@ -528,38 +496,32 @@ int main(
         return 1;
     }
 
-    cout << "Backup listening on port "
-         << port
-         << endl;
+    cout << "Backup listening on port " << port << endl;
 
     while (true)
     {
         sockaddr_in clientAddress{};
-        socklen_t length =
-            sizeof(clientAddress);
+        socklen_t length = sizeof(clientAddress);
 
-        int clientSocket =
-            accept(
-                serverSocket,
-                reinterpret_cast<sockaddr*>(
-                    &clientAddress),
-                &length);
+        // Accept a new client/primary connection.
+        int clientSocket = accept(serverSocket,
+                                  reinterpret_cast<sockaddr *>(&clientAddress),
+                                  &length);
 
         if (clientSocket == -1)
         {
             if (errno == EINTR)
                 continue;
 
-            cerr << "Accept failed"
-                 << endl;
+            cerr << "Accept failed" << endl;
 
             continue;
         }
 
-        thread(
-            handleClient,
-            clientSocket
-        ).detach();
+        // Handle each connection in its own thread.
+        thread(handleClient,
+               clientSocket)
+            .detach();
     }
 
     close(serverSocket);
