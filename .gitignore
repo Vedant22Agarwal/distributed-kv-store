@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+
+# VS Code
+.vscode/
+
+# Compiled binaries
+primary_node
+backup_node
+router
+tcp_client
+
+# WAL / runtime data
+*.wal
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
